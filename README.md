@@ -1,6 +1,6 @@
 # nol.auth
 
-Authentification et autorisation en pur [Nolc](https://github.com/Noliae-France/nolc), sans dépendance lourde.
+Authentification et autorisation en pur [Nolc](https://noliae-nolc.s3.gra.io.cloud.ovh.net/nolc-latest-linux-x86_64.tar.gz), sans dépendance lourde.
 
 > **État : fondation (v0.1).** Les primitives ci-dessous sont implémentées et testées. La feuille de route liste la suite. Construit lot par lot, chaque étape avec CI verte.
 
