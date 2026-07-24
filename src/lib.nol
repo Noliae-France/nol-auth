@@ -1,0 +1,53 @@
+// nol.auth — authentification et autorisation en pur Nolc.
+//
+// Fondation du module : extraction du jeton « Bearer » et vérification de
+// permissions RBAC simples. Les sessions signées, cookies sûrs, JWT, OAuth 2.0
+// et OpenID Connect (identité fédérée) s'appuieront sur nol.crypto et arrivent
+// lot par lot — voir README. Réf. OIDC : https://openid.net/specs/openid-connect-core-1_0.html
+
+// Extrait le jeton d'un en-tête « Authorization: Bearer <jeton> ».
+fn bearer_extrait(entete: Text) -> Option<Text> {
+    let prefixe = "Bearer "
+    let p = len(prefixe)
+    if len(entete) <= p {
+        return none
+    }
+    if sub(entete, 0, p) != prefixe {
+        return none
+    }
+    return some(sub(entete, p, len(entete) - p))
+}
+
+// RBAC minimal : le rôle possède-t-il la permission ? Un rôle « admin »
+// possède toutes les permissions.
+fn rbac_autorise(role: Text, permissions: List<Text>, requise: Text) -> Bool {
+    if role == "admin" {
+        return true
+    }
+    for perm in permissions {
+        if perm == requise {
+            return true
+        }
+    }
+    return false
+}
+
+// ============================ TESTS ============================
+
+fn test_bearer() {
+    match bearer_extrait("Bearer abc.def") {
+        some(j) => assert(j == "abc.def", "jeton extrait"),
+        none => assert(false, "aurait du extraire"),
+    }
+    assert(unwrap_or(bearer_extrait("Basic xyz"), "NON") == "NON", "mauvais schema")
+    assert(unwrap_or(bearer_extrait("Bearer "), "NON") == "NON", "jeton vide")
+}
+
+fn test_rbac() {
+    var perms: List<Text> = []
+    push(perms, "lire")
+    push(perms, "ecrire")
+    assert(rbac_autorise("editeur", perms, "ecrire"), "permission accordee")
+    assert(not rbac_autorise("editeur", perms, "supprimer"), "permission refusee")
+    assert(rbac_autorise("admin", perms, "supprimer"), "admin tout permis")
+}

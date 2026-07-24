@@ -1,0 +1,9 @@
+[projet]
+nom = "nol-auth"
+version = "0.1.0"
+entree = "src/lib.nol"
+auteur = "Bastien LANGUEDOC"
+licence = "MIT"
+description = "Authentification Nolc : sessions signees, cookies surs, JWT, OAuth 2.0, OIDC, RBAC."
+
+[dependances]
