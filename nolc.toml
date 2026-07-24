@@ -1,9 +1,9 @@
 [projet]
 nom = "nol-auth"
-version = "0.1.0"
+version = "0.2.0"
 entree = "src/lib.nol"
 auteur = "daliranas <bastien@languedoc.ovh>"
 licence = "MIT"
-description = "Authentification Nolc : sessions signées, cookies sûrs, JWT, OAuth 2.0, OIDC, RBAC."
+description = "Authentification Nolc : JWT HS256 et sessions signées (HMAC-SHA256 réel, temps constant), Bearer, RBAC."
 
 [dependances]

@@ -1,9 +1,403 @@
 // nol.auth — authentification et autorisation en pur Nolc.
 //
-// Fondation du module : extraction du jeton « Bearer » et vérification de
-// permissions RBAC simples. Les sessions signées, cookies sûrs, JWT, OAuth 2.0
-// et OpenID Connect (identité fédérée) s'appuieront sur nol.crypto et arrivent
-// lot par lot — voir README. Réf. OIDC : https://openid.net/specs/openid-connect-core-1_0.html
+// Sessions signées et JWT HS256 reposant sur un VRAI HMAC-SHA256 (bibliothèque
+// crypto de la stdlib Nolc, RFC 2104/6234). Plus extraction du jeton Bearer et
+// RBAC. OAuth 2.0 / OpenID Connect : feuille de route.
+// Réf. JWT : RFC 7519. Réf. OIDC : https://openid.net/specs/openid-connect-core-1_0.html
+
+// ---- Crypto vendorisée depuis la stdlib Nolc (crypto.nol, MIT) ----
+// Base64, SHA-256, HMAC-SHA256, comparaison à temps constant.
+fn b64_alphabet() -> Text {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+}
+
+fn base64_encode(b: Bytes) -> Text {
+    let alpha = b64_alphabet()
+    let n = len(b)
+    var out = ""
+    var i = 0
+    while i < n {
+        let reste = n - i
+        let o0 = bytes_get(b, i)
+        var o1 = 0
+        var o2 = 0
+        if reste > 1 {
+            o1 = bytes_get(b, i + 1)
+        }
+        if reste > 2 {
+            o2 = bytes_get(b, i + 2)
+        }
+        let bloc = bit_or(bit_or(bit_shl(o0, 16), bit_shl(o1, 8)), o2)
+        out = out + char_at(alpha, bit_and(bit_shr(bloc, 18), 63))
+        out = out + char_at(alpha, bit_and(bit_shr(bloc, 12), 63))
+        if reste > 1 {
+            out = out + char_at(alpha, bit_and(bit_shr(bloc, 6), 63))
+        } else {
+            out = out + "="
+        }
+        if reste > 2 {
+            out = out + char_at(alpha, bit_and(bloc, 63))
+        } else {
+            out = out + "="
+        }
+        i = i + 3
+    }
+    return out
+}
+
+// Valeur d'un caractère base64, ou none si hors alphabet.
+fn b64_valeur(c: Int) -> Option<Int> {
+    if c >= 65 and c <= 90 {
+        return some(c - 65)
+    }
+    if c >= 97 and c <= 122 {
+        return some(c - 71)
+    }
+    if c >= 48 and c <= 57 {
+        return some(c + 4)
+    }
+    if c == 43 {
+        return some(62)
+    }
+    if c == 47 {
+        return some(63)
+    }
+    return none
+}
+
+fn base64_decode(t: Text) -> Option<Bytes> {
+    let src = bytes_from_text(t)
+    let n = len(src)
+    if n % 4 != 0 {
+        return none
+    }
+    var out = bytes_new()
+    if n == 0 {
+        return some(out)
+    }
+    var i = 0
+    while i < n {
+        let c0 = bytes_get(src, i)
+        let c1 = bytes_get(src, i + 1)
+        let c2 = bytes_get(src, i + 2)
+        let c3 = bytes_get(src, i + 3)
+        let v0 = b64_valeur(c0)
+        let v1 = b64_valeur(c1)
+        if not has(v0) or not has(v1) {
+            return none
+        }
+        // Le padding "=" (61) n'est autorisé que sur les deux derniers
+        // caractères du dernier bloc.
+        let dernier = i + 4 == n
+        var pad2 = false
+        var pad3 = false
+        if c2 == 61 {
+            if not dernier {
+                return none
+            }
+            pad2 = true
+        }
+        if c3 == 61 {
+            if not dernier {
+                return none
+            }
+            pad3 = true
+        }
+        // "=X" (pad2 sans pad3) est invalide.
+        if pad2 and not pad3 {
+            return none
+        }
+        var w2 = 0
+        var w3 = 0
+        if not pad2 {
+            if not has(b64_valeur(c2)) {
+                return none
+            }
+            w2 = unwrap_or(b64_valeur(c2), 0)
+        }
+        if not pad3 {
+            if not has(b64_valeur(c3)) {
+                return none
+            }
+            w3 = unwrap_or(b64_valeur(c3), 0)
+        }
+        let bloc = bit_or(bit_or(bit_or(bit_shl(unwrap_or(v0, 0), 18), bit_shl(unwrap_or(v1, 0), 12)), bit_shl(w2, 6)), w3)
+        bytes_push(out, bit_and(bit_shr(bloc, 16), 255))
+        if not pad2 {
+            bytes_push(out, bit_and(bit_shr(bloc, 8), 255))
+        }
+        if not pad3 {
+            bytes_push(out, bit_and(bloc, 255))
+        }
+        i = i + 4
+    }
+    return some(out)
+}
+
+// ------------------- SHA-256 -------------------
+
+// ------------------- SHA-1 -------------------
+// SHA-1 n'est plus recommandé pour de nouvelles signatures. Il reste requis
+// par certains protocoles historiques, notamment le handshake WebSocket
+// (`Sec-WebSocket-Accept`, RFC 6455).
+
+fn sha_rotr(x: Int, n: Int) -> Int {
+    return bit_and(bit_or(bit_shr(x, n), bit_shl(x, 32 - n)), 4294967295)
+}
+
+// Masque 32 bits (modulo 2^32).
+fn sha_m32(x: Int) -> Int {
+    return bit_and(x, 4294967295)
+}
+
+fn sha_k() -> List<Int> {
+    return [1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]
+}
+
+fn sha_h0() -> List<Int> {
+    return [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]
+}
+
+// Traite un bloc de 64 octets à partir de « decalage » et met à jour h.
+fn sha_bloc(h: List<Int>, bloc: Bytes, decalage: Int, k: List<Int>) {
+    var w: List<Int> = []
+    var t = 0
+    while t < 16 {
+        let j = decalage + t * 4
+        let mot = bit_or(bit_or(bit_or(bit_shl(bytes_get(bloc, j), 24), bit_shl(bytes_get(bloc, j + 1), 16)), bit_shl(bytes_get(bloc, j + 2), 8)), bytes_get(bloc, j + 3))
+        push(w, mot)
+        t = t + 1
+    }
+    t = 16
+    while t < 64 {
+        let x15 = get(w, t - 15)
+        let x2 = get(w, t - 2)
+        let s0 = bit_xor(bit_xor(sha_rotr(x15, 7), sha_rotr(x15, 18)), bit_shr(x15, 3))
+        let s1 = bit_xor(bit_xor(sha_rotr(x2, 17), sha_rotr(x2, 19)), bit_shr(x2, 10))
+        push(w, sha_m32(get(w, t - 16) + s0 + get(w, t - 7) + s1))
+        t = t + 1
+    }
+    var a = get(h, 0)
+    var b = get(h, 1)
+    var c = get(h, 2)
+    var d = get(h, 3)
+    var e = get(h, 4)
+    var f = get(h, 5)
+    var g = get(h, 6)
+    var hh = get(h, 7)
+    t = 0
+    while t < 64 {
+        let ge1 = bit_xor(bit_xor(sha_rotr(e, 6), sha_rotr(e, 11)), sha_rotr(e, 25))
+        let ch = bit_xor(bit_and(e, f), bit_and(bit_not(e), g))
+        let t1 = sha_m32(hh + ge1 + ch + get(k, t) + get(w, t))
+        let ga0 = bit_xor(bit_xor(sha_rotr(a, 2), sha_rotr(a, 13)), sha_rotr(a, 22))
+        let maj = bit_xor(bit_xor(bit_and(a, b), bit_and(a, c)), bit_and(b, c))
+        let t2 = sha_m32(ga0 + maj)
+        hh = g
+        g = f
+        f = e
+        e = sha_m32(d + t1)
+        d = c
+        c = b
+        b = a
+        a = sha_m32(t1 + t2)
+        t = t + 1
+    }
+    list_set(h, 0, sha_m32(get(h, 0) + a))
+    list_set(h, 1, sha_m32(get(h, 1) + b))
+    list_set(h, 2, sha_m32(get(h, 2) + c))
+    list_set(h, 3, sha_m32(get(h, 3) + d))
+    list_set(h, 4, sha_m32(get(h, 4) + e))
+    list_set(h, 5, sha_m32(get(h, 5) + f))
+    list_set(h, 6, sha_m32(get(h, 6) + g))
+    list_set(h, 7, sha_m32(get(h, 7) + hh))
+}
+
+fn sha256(b: Bytes) -> Bytes {
+    let taille = len(b)
+    // Message rembourré : copie + 0x80 + zéros + longueur en bits (64 bits BE).
+    var m = bytes_new()
+    bytes_append(m, b)
+    bytes_push(m, 128)
+    while len(m) % 64 != 56 {
+        bytes_push(m, 0)
+    }
+    let bits = taille * 8
+    var i = 0
+    while i < 8 {
+        bytes_push(m, bit_and(bit_shr(bits, (7 - i) * 8), 255))
+        i = i + 1
+    }
+    var h = sha_h0()
+    let k = sha_k()
+    var decalage = 0
+    while decalage < len(m) {
+        sha_bloc(h, m, decalage, k)
+        decalage = decalage + 64
+    }
+    var out = bytes_new()
+    var w = 0
+    while w < 8 {
+        let mot = get(h, w)
+        bytes_push(out, bit_and(bit_shr(mot, 24), 255))
+        bytes_push(out, bit_and(bit_shr(mot, 16), 255))
+        bytes_push(out, bit_and(bit_shr(mot, 8), 255))
+        bytes_push(out, bit_and(mot, 255))
+        w = w + 1
+    }
+    return out
+}
+
+fn hmac_sha256(cle: Bytes, message: Bytes) -> Bytes {
+    let bloc_taille = 64
+    // Clé normalisée à 64 octets (hachée si trop longue, complétée de zéros).
+    var cle_norm = bytes_new()
+    if len(cle) > bloc_taille {
+        bytes_append(cle_norm, sha256(cle))
+    } else {
+        bytes_append(cle_norm, cle)
+    }
+    while len(cle_norm) < bloc_taille {
+        bytes_push(cle_norm, 0)
+    }
+    var ipad = bytes_new()
+    var opad = bytes_new()
+    var i = 0
+    while i < bloc_taille {
+        let o = bytes_get(cle_norm, i)
+        bytes_push(ipad, bit_xor(o, 54))
+        bytes_push(opad, bit_xor(o, 92))
+        i = i + 1
+    }
+    // interne = SHA-256(ipad || message)
+    var interne = bytes_new()
+    bytes_append(interne, ipad)
+    bytes_append(interne, message)
+    let h_interne = sha256(interne)
+    // externe = SHA-256(opad || interne)
+    var externe = bytes_new()
+    bytes_append(externe, opad)
+    bytes_append(externe, h_interne)
+    return sha256(externe)
+}
+
+fn bytes_egal_ct(a: Bytes, b: Bytes) -> Bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var diff = 0
+    var i = 0
+    while i < len(a) {
+        diff = bit_or(diff, bit_xor(bytes_get(a, i), bytes_get(b, i)))
+        i = i + 1
+    }
+    return diff == 0
+}
+
+
+// ---- Base64URL (JWT) : base64 standard adapté (- _ , sans remplissage) ----
+
+fn b64url(b: Bytes) -> Text {
+    var s = base64_encode(b)
+    s = replace(s, "+", "-")
+    s = replace(s, "/", "_")
+    s = replace(s, "=", "")
+    return s
+}
+fn b64url_texte(t: Text) -> Text {
+    return b64url(bytes_from_text(t))
+}
+// Décode une chaîne base64url en octets (none si invalide).
+fn b64url_bytes(s: Text) -> Option<Bytes> {
+    var t = replace(s, "-", "+")
+    t = replace(t, "_", "/")
+    while len(t) % 4 != 0 {
+        t = t + "="
+    }
+    return base64_decode(t)
+}
+
+// Décode une chaîne base64url en texte (none si invalide).
+fn b64url_decode_texte(s: Text) -> Option<Text> {
+    let b = b64url_bytes(s)
+    if not has(b) {
+        return none
+    }
+    return bytes_to_text(unwrap_or(b, bytes_new()))
+}
+
+// ---- Sessions signées (HMAC-SHA256) ----
+
+// Signe « valeur » : renvoie « valeur.signature » (signature = HMAC base64url).
+fn session_signe(valeur: Text, cle: Text) -> Text {
+    let sig = b64url(hmac_sha256(bytes_from_text(cle), bytes_from_text(valeur)))
+    return valeur + "." + sig
+}
+
+// Vérifie une valeur signée et renvoie la valeur si la signature est valide.
+fn session_verifie(signe: Text, cle: Text) -> Option<Text> {
+    let parts = split(signe, ".")
+    let n = len(parts)
+    if n < 2 {
+        return none
+    }
+    // La valeur peut contenir des points : tout sauf le dernier segment.
+    var valeur = ""
+    var i = 0
+    while i < n - 1 {
+        if i > 0 {
+            valeur = valeur + "."
+        }
+        valeur = valeur + get(parts, i)
+        i += 1
+    }
+    let sig = get(parts, n - 1)
+    let attendu = hmac_sha256(bytes_from_text(cle), bytes_from_text(valeur))
+    let fournie = b64url_bytes(sig)
+    if not has(fournie) {
+        return none
+    }
+    // Comparaison à temps constant (anti timing-attack).
+    if bytes_egal_ct(attendu, unwrap_or(fournie, bytes_new())) {
+        return some(valeur)
+    }
+    return none
+}
+
+// ---- JWT HS256 ----
+
+// Émet un JWT signé HS256 à partir d'un payload JSON.
+fn jwt_signe(payload_json: Text, cle: Text) -> Text {
+    let entete = b64url_texte("{\"alg\":\"HS256\",\"typ\":\"JWT\"}")
+    let charge = b64url_texte(payload_json)
+    let message = entete + "." + charge
+    let sig = b64url(hmac_sha256(bytes_from_text(cle), bytes_from_text(message)))
+    return message + "." + sig
+}
+
+// Vérifie la signature HS256 d'un JWT.
+fn jwt_verifie(jeton: Text, cle: Text) -> Bool {
+    let parts = split(jeton, ".")
+    if len(parts) != 3 {
+        return false
+    }
+    let message = get(parts, 0) + "." + get(parts, 1)
+    let attendu = hmac_sha256(bytes_from_text(cle), bytes_from_text(message))
+    let fournie = b64url_bytes(get(parts, 2))
+    if not has(fournie) {
+        return false
+    }
+    return bytes_egal_ct(attendu, unwrap_or(fournie, bytes_new()))
+}
+
+// Charge le payload JSON d'un JWT (SANS vérifier la signature — vérifier avant).
+fn jwt_charge(jeton: Text) -> Option<Text> {
+    let parts = split(jeton, ".")
+    if len(parts) != 3 {
+        return none
+    }
+    return b64url_decode_texte(get(parts, 1))
+}
 
 // Extrait le jeton d'un en-tête « Authorization: Bearer <jeton> ».
 fn bearer_extrait(entete: Text) -> Option<Text> {
@@ -41,6 +435,30 @@ fn test_bearer() {
     }
     assert(unwrap_or(bearer_extrait("Basic xyz"), "NON") == "NON", "mauvais schema")
     assert(unwrap_or(bearer_extrait("Bearer "), "NON") == "NON", "jeton vide")
+}
+
+fn test_session() {
+    let cle = "secret-partage"
+    let signe = session_signe("utilisateur:42", cle)
+    assert(contains(signe, "utilisateur:42."), "valeur + signature")
+    assert(unwrap_or(session_verifie(signe, cle), "") == "utilisateur:42", "verifie OK")
+    // Mauvaise clé : rejet.
+    assert(not has(session_verifie(signe, "autre-cle")), "mauvaise cle rejetee")
+    // Altération de la valeur : rejet.
+    assert(not has(session_verifie("utilisateur:99." + get(split(signe, "."), 1), cle)), "valeur alteree")
+}
+
+fn test_jwt() {
+    let cle = "ma-cle-hs256"
+    let jeton = jwt_signe("{\"sub\":\"42\",\"role\":\"admin\"}", cle)
+    assert(len(split(jeton, ".")) == 3, "trois segments")
+    assert(jwt_verifie(jeton, cle), "signature valide")
+    assert(not jwt_verifie(jeton, "mauvaise"), "mauvaise cle rejetee")
+    // Payload rechargeable.
+    assert(unwrap_or(jwt_charge(jeton), "") == "{\"sub\":\"42\",\"role\":\"admin\"}", "payload decode")
+    // Jeton falsifié (signature d'une autre clé) refusé.
+    let forge = jwt_signe("{\"sub\":\"admin\"}", "cle-attaquant")
+    assert(not jwt_verifie(forge, cle), "jeton forge refuse")
 }
 
 fn test_rbac() {
